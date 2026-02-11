@@ -1,0 +1,24 @@
+services:
+  claude-context:
+    image: node:20-alpine
+    restart: unless-stopped
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY}
+      - MILVUS_ADDRESS=${MILVUS_ADDRESS}
+      - MILVUS_TOKEN=${MILVUS_TOKEN}
+    command: ["sh", "-c", "npx @zilliztech/claude-context-mcp@latest"]
+    ports:
+      - "11435:11435"
+    networks:
+      - dokploy-network
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+        reservations:
+          memory: 512M
+
+networks:
+  dokploy-network:
+    external: true
+    name: dokploy-network
