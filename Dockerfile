@@ -2,11 +2,9 @@ FROM node:20-alpine
 
 WORKDIR /app
 
-# Instala npx globalmente se necessário
-RUN npm install -g npx
+# npx já existe, não precisa instalar
 
-# Copia env vars (Dokploy injeta automaticamente)
 COPY . .
 
-# Comando de start: roda o MCP server oficial
+# Start: roda o servidor MCP oficial
 CMD ["npx", "@zilliztech/claude-context-mcp@latest"]
