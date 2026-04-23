@@ -17,6 +17,7 @@ export class SnapshotManager {
     private indexingCodebases: Map<string, number> = new Map(); // Map of codebase path to progress percentage
     private codebaseFileCount: Map<string, number> = new Map(); // Map of codebase path to indexed file count
     private codebaseInfoMap: Map<string, CodebaseInfo> = new Map(); // Map of codebase path to complete info
+    private recentlyRemoved: Set<string> = new Set(); // Tracks codebases removed since last save
 
     constructor() {
         // Initialize snapshot file path
@@ -44,6 +45,7 @@ export class SnapshotManager {
                 console.log(`[SNAPSHOT-DEBUG] Validated codebase: ${codebasePath}`);
             } else {
                 console.warn(`[SNAPSHOT-DEBUG] Codebase no longer exists, removing: ${codebasePath}`);
+                this.recentlyRemoved.add(codebasePath);
             }
         }
 
@@ -65,6 +67,7 @@ export class SnapshotManager {
                 // Don't add to validIndexingCodebases - treat as not indexed
             } else {
                 console.warn(`[SNAPSHOT-DEBUG] Interrupted indexing codebase no longer exists: ${codebasePath}`);
+                this.recentlyRemoved.add(codebasePath);
             }
         }
 
@@ -102,6 +105,7 @@ export class SnapshotManager {
         for (const [codebasePath, info] of Object.entries(snapshot.codebases)) {
             if (!fs.existsSync(codebasePath)) {
                 console.warn(`[SNAPSHOT-DEBUG] Codebase no longer exists, removing: ${codebasePath}`);
+                this.recentlyRemoved.add(codebasePath);
                 continue;
             }
 
@@ -115,11 +119,14 @@ export class SnapshotManager {
                 }
                 console.log(`[SNAPSHOT-DEBUG] Validated indexed codebase: ${codebasePath} (${info.indexedFiles || 'unknown'} files, ${info.totalChunks || 'unknown'} chunks)`);
             } else if (info.status === 'indexing') {
-                if ('indexingPercentage' in info) {
-                    validIndexingCodebases.set(codebasePath, info.indexingPercentage);
-                }
-                console.warn(`[SNAPSHOT-DEBUG] Found interrupted indexing codebase: ${codebasePath} (${info.indexingPercentage || 0}%). Treating as not indexed.`);
-                // Don't add to indexed - treat interrupted indexing as not indexed
+                console.warn(`[SNAPSHOT] Found interrupted indexing for '${codebasePath}', resetting to failed`);
+                const failedInfo: CodebaseInfoIndexFailed = {
+                    status: 'indexfailed',
+                    errorMessage: 'Indexing was interrupted (MCP server restarted)',
+                    lastAttemptedPercentage: info.indexingPercentage,
+                    lastUpdated: new Date().toISOString()
+                };
+                validCodebaseInfoMap.set(codebasePath, failedInfo);
             } else if (info.status === 'indexfailed') {
                 console.warn(`[SNAPSHOT-DEBUG] Found failed indexing codebase: ${codebasePath}. Error: ${info.errorMessage}`);
                 // Failed indexing codebases are not added to indexed or indexing lists
@@ -355,6 +362,16 @@ export class SnapshotManager {
         codebasePath: string,
         stats: { indexedFiles: number; totalChunks: number; status: 'completed' | 'limit_reached' }
     ): void {
+        // Defensive guard: 0/0 + completed is a known-bad state that causes an
+        // infinite force-reindex loop — the client reads it as "not indexed",
+        // triggers force=true, deletes real data, and rewrites 0/0. Refuse to
+        // persist this combination regardless of who called us. See Issue #295.
+        if (stats.indexedFiles === 0 && stats.totalChunks === 0 && stats.status === 'completed') {
+            console.error(`[SNAPSHOT] Refusing to write 0/0+completed for '${codebasePath}' — invalid state. Stack trace:`);
+            console.trace();
+            return;
+        }
+
         // Add to indexed list if not already there
         if (!this.indexedCodebases.includes(codebasePath)) {
             this.indexedCodebases.push(codebasePath);
@@ -434,6 +451,9 @@ export class SnapshotManager {
         this.codebaseFileCount.delete(codebasePath);
         this.codebaseInfoMap.delete(codebasePath);
 
+        // Track removal so mergeExternalEntry won't re-add it from disk
+        this.recentlyRemoved.add(codebasePath);
+
         console.log(`[SNAPSHOT-DEBUG] Completely removed codebase from snapshot: ${codebasePath}`);
     }
 
@@ -466,8 +486,61 @@ export class SnapshotManager {
         }
     }
 
+    private acquireLock(maxRetries = 5, retryInterval = 100): boolean {
+        const lockPath = this.snapshotFilePath + '.lock';
+        for (let i = 0; i < maxRetries; i++) {
+            try {
+                fs.mkdirSync(lockPath);
+                return true;
+            } catch {
+                // Check for stale lock (> 10 seconds old)
+                try {
+                    const stat = fs.statSync(lockPath);
+                    if (Date.now() - stat.mtimeMs > 10000) {
+                        fs.rmdirSync(lockPath);
+                        continue; // retry after removing stale lock
+                    }
+                } catch { /* lock was removed by another process */ }
+                // Busy wait and retry
+                const waitUntil = Date.now() + retryInterval;
+                while (Date.now() < waitUntil) { /* busy wait */ }
+            }
+        }
+        return false;
+    }
+
+    private releaseLock(): void {
+        try {
+            fs.rmdirSync(this.snapshotFilePath + '.lock');
+        } catch { /* already released */ }
+    }
+
+    private mergeExternalEntry(codebasePath: string, info: CodebaseInfo): void {
+        if (this.codebaseInfoMap.has(codebasePath)) return; // we already know about it
+        if (this.recentlyRemoved.has(codebasePath)) return; // explicitly removed, don't re-add from disk
+        this.codebaseInfoMap.set(codebasePath, info);
+        if (info.status === 'indexed') {
+            if (!this.indexedCodebases.includes(codebasePath)) {
+                this.indexedCodebases.push(codebasePath);
+            }
+            if (info.indexedFiles !== undefined) {
+                this.codebaseFileCount.set(codebasePath, info.indexedFiles);
+            }
+        } else if (info.status === 'indexing') {
+            if (!this.indexingCodebases.has(codebasePath)) {
+                this.indexingCodebases.set(codebasePath, info.indexingPercentage || 0);
+            }
+        }
+        // indexfailed entries only need codebaseInfoMap, no extra list
+    }
+
     public saveCodebaseSnapshot(): void {
         console.log('[SNAPSHOT-DEBUG] Saving codebase snapshot to:', this.snapshotFilePath);
+
+        const locked = this.acquireLock();
+        if (!locked) {
+            console.warn('[SNAPSHOT-DEBUG] Failed to acquire lock, saving without lock');
+        }
 
         try {
             // Ensure directory exists
@@ -475,6 +548,21 @@ export class SnapshotManager {
             if (!fs.existsSync(snapshotDir)) {
                 fs.mkdirSync(snapshotDir, { recursive: true });
                 console.log('[SNAPSHOT-DEBUG] Created snapshot directory:', snapshotDir);
+            }
+
+            // Read-merge: merge entries from disk that we don't have in memory
+            try {
+                if (fs.existsSync(this.snapshotFilePath)) {
+                    const diskData = fs.readFileSync(this.snapshotFilePath, 'utf8');
+                    const diskSnapshot = JSON.parse(diskData);
+                    if (this.isV2Format(diskSnapshot)) {
+                        for (const [diskPath, diskInfo] of Object.entries(diskSnapshot.codebases)) {
+                            this.mergeExternalEntry(diskPath, diskInfo as CodebaseInfo);
+                        }
+                    }
+                }
+            } catch (mergeError) {
+                console.warn('[SNAPSHOT-DEBUG] Error reading disk snapshot for merge, continuing with in-memory state:', mergeError);
             }
 
             // Build v2 format snapshot using the complete info map
@@ -493,6 +581,9 @@ export class SnapshotManager {
 
             fs.writeFileSync(this.snapshotFilePath, JSON.stringify(snapshot, null, 2));
 
+            // Clear recently removed set after successful save
+            this.recentlyRemoved.clear();
+
             const indexedCount = this.indexedCodebases.length;
             const indexingCount = this.indexingCodebases.size;
             const failedCount = this.getFailedCodebases().length;
@@ -501,6 +592,10 @@ export class SnapshotManager {
 
         } catch (error: any) {
             console.error('[SNAPSHOT-DEBUG] Error saving snapshot:', error);
+        } finally {
+            if (locked) {
+                this.releaseLock();
+            }
         }
     }
 } 

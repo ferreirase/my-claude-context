@@ -19,11 +19,137 @@ export class ToolHandlers {
     }
 
     /**
+     * Query Milvus for the real row count of a codebase's collection.
+     * Returns null if the count cannot be determined — callers must NOT write a
+     * snapshot entry in that case. Writing { indexedFiles: 0, totalChunks: 0,
+     * status: 'completed' } for an unknown-state collection poisons the client:
+     * the client treats 0/0 as "not indexed" and triggers force reindex, which
+     * deletes real data and rewrites 0/0 — an infinite loop. See Issue #295.
+     */
+    private async queryCollectionStats(codebasePath: string): Promise<{ indexedFiles: number; totalChunks: number } | null> {
+        try {
+            const collectionName = this.context.getCollectionName(codebasePath);
+            const rowCount = await this.context.getVectorDatabase().getCollectionRowCount(collectionName);
+            if (rowCount < 0) {
+                console.warn(`[SNAPSHOT-RECOVERY] Row count unknown for '${codebasePath}', skipping recovery write`);
+                return null;
+            }
+            if (rowCount === 0) {
+                console.warn(`[SNAPSHOT-RECOVERY] Collection '${collectionName}' truly empty — NOT writing recovered entry (would poison client)`);
+                return null;
+            }
+            // rowCount is chunk count, not file count. Without a metadata query
+            // we don't have the real file count; the snapshot will be corrected
+            // on the next full index. Using rowCount for both is imprecise but
+            // keeps the state non-zero so the client doesn't misread it as empty.
+            return { indexedFiles: rowCount, totalChunks: rowCount };
+        } catch (error) {
+            console.warn(`[SNAPSHOT-RECOVERY] Failed to query stats for '${codebasePath}':`, error);
+            return null;
+        }
+    }
+
+    /**
+     * One-shot startup validation: find any legacy 0/0+completed entries on disk
+     * (left over from old MCP versions, v1 snapshot migrations, or pre-fix recovery
+     * paths) and either heal them with the real Milvus row count or remove them
+     * if the underlying collection is empty/missing. See Issue #295.
+     *
+     * Safe to call multiple times but intended to run once per server start after
+     * loadCodebaseSnapshot(). Errors are caught and logged; never throws.
+     */
+    public async validateLegacyZeroEntries(): Promise<void> {
+        try {
+            const indexedCodebases = this.snapshotManager.getIndexedCodebases();
+            let healed = 0, removed = 0, skipped = 0, checked = 0;
+
+            for (const codebasePath of indexedCodebases) {
+                const info = this.snapshotManager.getCodebaseInfo(codebasePath);
+                if (!info || info.status !== 'indexed') continue;
+                // Only validate suspiciously-zero entries
+                if (info.indexedFiles !== 0 || info.totalChunks !== 0) continue;
+
+                checked++;
+                const collectionName = this.context.getCollectionName(codebasePath);
+                const vdb = this.context.getVectorDatabase();
+
+                // First probe: does the collection even exist? A "no" here is
+                // authoritative (permanent orphan), while a throw is most likely
+                // transient (Milvus unreachable) — keep those two cases distinct
+                // so we don't destroy real state on a network blip.
+                let collectionExists: boolean;
+                try {
+                    collectionExists = await vdb.hasCollection(collectionName);
+                } catch (err) {
+                    console.warn(`[SNAPSHOT-VALIDATE] hasCollection failed for '${codebasePath}' (likely transient), skipping:`, err);
+                    skipped++;
+                    continue;
+                }
+
+                if (!collectionExists) {
+                    // Permanent orphan — no matching Milvus collection, so the
+                    // 0/0+completed snapshot entry is a pure phantom. Remove it.
+                    this.snapshotManager.removeCodebaseCompletely(codebasePath);
+                    removed++;
+                    console.warn(`[SNAPSHOT-VALIDATE] Removed orphan 0/0 entry '${codebasePath}' — no matching Milvus collection`);
+                    continue;
+                }
+
+                // Collection exists — get an accurate row count.
+                let rowCount: number;
+                try {
+                    rowCount = await vdb.getCollectionRowCount(collectionName);
+                } catch (err) {
+                    console.warn(`[SNAPSHOT-VALIDATE] getCollectionRowCount failed for '${codebasePath}', skipping:`, err);
+                    skipped++;
+                    continue;
+                }
+
+                if (rowCount > 0) {
+                    // Heal: rewrite with real row count. rowCount is chunk count;
+                    // without a cheap file-count query we reuse it for both fields.
+                    // Imprecise but keeps the state non-zero and will be corrected
+                    // on the next full index.
+                    this.snapshotManager.setCodebaseIndexed(codebasePath, {
+                        indexedFiles: rowCount,
+                        totalChunks: rowCount,
+                        status: 'completed' as const,
+                    });
+                    healed++;
+                    console.log(`[SNAPSHOT-VALIDATE] Healed legacy 0/0 entry '${codebasePath}' → rows=${rowCount}`);
+                } else if (rowCount === 0) {
+                    // Collection exists but truly empty — the 0/0+completed entry
+                    // is a phantom. Remove so the user must explicitly reindex.
+                    this.snapshotManager.removeCodebaseCompletely(codebasePath);
+                    removed++;
+                    console.warn(`[SNAPSHOT-VALIDATE] Removed phantom 0/0 entry '${codebasePath}' — collection exists but empty`);
+                } else {
+                    // rowCount === -1 despite the collection existing: the count
+                    // query failed after the existence probe succeeded. Treat as
+                    // transient and leave the entry alone.
+                    skipped++;
+                    console.warn(`[SNAPSHOT-VALIDATE] Row count unavailable for existing collection '${codebasePath}', skipping`);
+                }
+            }
+
+            if (healed > 0 || removed > 0) {
+                this.snapshotManager.saveCodebaseSnapshot();
+            }
+            if (checked > 0) {
+                console.log(`[SNAPSHOT-VALIDATE] Done — checked=${checked} healed=${healed} removed=${removed} skipped=${skipped}`);
+            }
+        } catch (error) {
+            console.warn(`[SNAPSHOT-VALIDATE] Unexpected error during legacy 0/0 validation (non-fatal):`, error);
+        }
+    }
+
+    /**
      * Sync indexed codebases from Zilliz Cloud collections
      * This method fetches all collections from the vector database,
-     * gets the first document from each collection to extract codebasePath from metadata,
+     * extracts codebasePath from collection description (preferred) or falls back
+     * to querying document metadata for old collections,
      * and updates the snapshot with discovered codebases.
-     * 
+     *
      * Logic: Compare mcp-codebase-snapshot.json with zilliz cloud collections
      * - If local snapshot has extra directories (not in cloud), remove them
      * - If local snapshot is missing directories (exist in cloud), ignore them
@@ -41,22 +167,13 @@ export class ToolHandlers {
             console.log(`[SYNC-CLOUD] 📋 Found ${collections.length} collections in Zilliz Cloud`);
 
             if (collections.length === 0) {
-                console.log(`[SYNC-CLOUD] ✅ No collections found in cloud`);
-                // If no collections in cloud, remove all local codebases
-                const localCodebases = this.snapshotManager.getIndexedCodebases();
-                if (localCodebases.length > 0) {
-                    console.log(`[SYNC-CLOUD] 🧹 Removing ${localCodebases.length} local codebases as cloud has no collections`);
-                    for (const codebasePath of localCodebases) {
-                        this.snapshotManager.removeIndexedCodebase(codebasePath);
-                        console.log(`[SYNC-CLOUD] ➖ Removed local codebase: ${codebasePath}`);
-                    }
-                    this.snapshotManager.saveCodebaseSnapshot();
-                    console.log(`[SYNC-CLOUD] 💾 Updated snapshot to match empty cloud state`);
-                }
+                console.log(`[SYNC-CLOUD] ✅ No collections found in cloud. Skipping deletion of local codebases to avoid data loss from transient errors.`);
                 return;
             }
 
             const cloudCodebases = new Set<string>();
+            let codeCollectionsChecked = 0;
+            let successfulExtractions = 0;
 
             // Check each collection for codebase path
             for (const collectionName of collections) {
@@ -67,39 +184,61 @@ export class ToolHandlers {
                         continue;
                     }
 
+                    codeCollectionsChecked++;
                     console.log(`[SYNC-CLOUD] 🔍 Checking collection: ${collectionName}`);
 
-                    // Query the first document to get metadata
-                    const results = await vectorDb.query(
-                        collectionName,
-                        '', // Empty filter to get all results
-                        ['metadata'], // Only fetch metadata field
-                        1 // Only need one result to extract codebasePath
-                    );
-
-                    if (results && results.length > 0) {
-                        const firstResult = results[0];
-                        const metadataStr = firstResult.metadata;
-
-                        if (metadataStr) {
-                            try {
-                                const metadata = JSON.parse(metadataStr);
-                                const codebasePath = metadata.codebasePath;
-
-                                if (codebasePath && typeof codebasePath === 'string') {
-                                    console.log(`[SYNC-CLOUD] 📍 Found codebase path: ${codebasePath} in collection: ${collectionName}`);
-                                    cloudCodebases.add(codebasePath);
-                                } else {
-                                    console.warn(`[SYNC-CLOUD] ⚠️  No codebasePath found in metadata for collection: ${collectionName}`);
-                                }
-                            } catch (parseError) {
-                                console.warn(`[SYNC-CLOUD] ⚠️  Failed to parse metadata JSON for collection ${collectionName}:`, parseError);
+                    // Try to extract codebasePath from collection description first (new format)
+                    let extracted = false;
+                    try {
+                        const description = await vectorDb.getCollectionDescription(collectionName);
+                        if (description && description.startsWith('codebasePath:')) {
+                            const codebasePath = description.substring('codebasePath:'.length);
+                            if (codebasePath.length > 0) {
+                                console.log(`[SYNC-CLOUD] 📍 Found codebase path from description: ${codebasePath} in collection: ${collectionName}`);
+                                cloudCodebases.add(codebasePath);
+                                successfulExtractions++;
+                                extracted = true;
                             }
-                        } else {
-                            console.warn(`[SYNC-CLOUD] ⚠️  No metadata found in collection: ${collectionName}`);
                         }
-                    } else {
-                        console.log(`[SYNC-CLOUD] ℹ️  Collection ${collectionName} is empty`);
+                    } catch (descError: any) {
+                        console.warn(`[SYNC-CLOUD] ⚠️  Failed to get description for collection ${collectionName}:`, descError.message || descError);
+                    }
+
+                    // Fallback: query document metadata for old collections without new description format
+                    if (!extracted) {
+                        console.log(`[SYNC-CLOUD] 🔄 Falling back to query-based extraction for collection: ${collectionName}`);
+                        try {
+                            const results = await vectorDb.query(
+                                collectionName,
+                                undefined as any, // Don't pass empty filter
+                                ['metadata'], // Only fetch metadata field
+                                1 // Only need one result to extract codebasePath
+                            );
+
+                            if (results && results.length > 0) {
+                                const firstResult = results[0];
+                                const metadataStr = firstResult.metadata;
+
+                                if (metadataStr) {
+                                    const metadata = JSON.parse(metadataStr);
+                                    const codebasePath = metadata.codebasePath;
+
+                                    if (codebasePath && typeof codebasePath === 'string') {
+                                        console.log(`[SYNC-CLOUD] 📍 Found codebase path from query: ${codebasePath} in collection: ${collectionName}`);
+                                        cloudCodebases.add(codebasePath);
+                                        successfulExtractions++;
+                                    } else {
+                                        console.warn(`[SYNC-CLOUD] ⚠️  No codebasePath found in metadata for collection: ${collectionName}`);
+                                    }
+                                } else {
+                                    console.warn(`[SYNC-CLOUD] ⚠️  No metadata found in collection: ${collectionName}`);
+                                }
+                            } else {
+                                console.log(`[SYNC-CLOUD] ℹ️  Collection ${collectionName} is empty`);
+                            }
+                        } catch (queryError: any) {
+                            console.warn(`[SYNC-CLOUD] ⚠️  Fallback query failed for collection ${collectionName}:`, queryError.message || queryError);
+                        }
                     }
                 } catch (collectionError: any) {
                     console.warn(`[SYNC-CLOUD] ⚠️  Error checking collection ${collectionName}:`, collectionError.message || collectionError);
@@ -107,7 +246,15 @@ export class ToolHandlers {
                 }
             }
 
-            console.log(`[SYNC-CLOUD] 📊 Found ${cloudCodebases.size} valid codebases in cloud`);
+            console.log(`[SYNC-CLOUD] 📊 Found ${cloudCodebases.size} valid codebases in cloud (checked ${codeCollectionsChecked} code collections, ${successfulExtractions} successfully extracted)`);
+
+            // Safety guard: if we checked code collections but none returned results,
+            // treat this as an extraction failure rather than "cloud is empty".
+            // This prevents deleting all local codebases due to transient errors.
+            if (codeCollectionsChecked > 0 && successfulExtractions === 0) {
+                console.warn(`[SYNC-CLOUD] ⚠️  All ${codeCollectionsChecked} code collection extractions failed. Skipping sync to avoid accidental deletion of local codebases.`);
+                return;
+            }
 
             // Get current local codebases
             const localCodebases = new Set(this.snapshotManager.getIndexedCodebases());
@@ -118,14 +265,30 @@ export class ToolHandlers {
             // Remove local codebases that don't exist in cloud
             for (const localCodebase of localCodebases) {
                 if (!cloudCodebases.has(localCodebase)) {
-                    this.snapshotManager.removeIndexedCodebase(localCodebase);
+                    this.snapshotManager.removeCodebaseCompletely(localCodebase);
                     hasChanges = true;
                     console.log(`[SYNC-CLOUD] ➖ Removed local codebase (not in cloud): ${localCodebase}`);
                 }
             }
 
-            // Note: We don't add cloud codebases that are missing locally (as per user requirement)
-            console.log(`[SYNC-CLOUD] ℹ️  Skipping addition of cloud codebases not present locally (per sync policy)`);
+            // Add cloud codebases that are missing from local snapshot (recovery).
+            // Query Milvus for the real row count — if unknown/empty, skip the write
+            // so we don't persist a poisoning 0/0+completed entry (Issue #295).
+            for (const cloudCodebase of cloudCodebases) {
+                if (!localCodebases.has(cloudCodebase)) {
+                    const stats = await this.queryCollectionStats(cloudCodebase);
+                    if (stats) {
+                        this.snapshotManager.setCodebaseIndexed(cloudCodebase, {
+                            ...stats,
+                            status: 'completed' as const
+                        });
+                        hasChanges = true;
+                        console.log(`[SYNC-CLOUD] ➕ Recovered codebase from cloud: ${cloudCodebase} (rows=${stats.totalChunks})`);
+                    } else {
+                        console.log(`[SYNC-CLOUD] ⏭️  Skipped recovery for ${cloudCodebase} (row count unknown or zero)`);
+                    }
+                }
+            }
 
             if (hasChanges) {
                 this.snapshotManager.saveCodebaseSnapshot();
@@ -190,18 +353,42 @@ export class ToolHandlers {
 
             // Check if already indexing
             if (this.snapshotManager.getIndexingCodebases().includes(absolutePath)) {
-                return {
-                    content: [{
-                        type: "text",
-                        text: `Codebase '${absolutePath}' is already being indexed in the background. Please wait for completion.`
-                    }],
-                    isError: true
-                };
+                if (forceReindex) {
+                    console.log(`[FORCE-REINDEX] Clearing stale indexing state for '${absolutePath}'`);
+                    this.snapshotManager.removeCodebaseCompletely(absolutePath);
+                    this.snapshotManager.saveCodebaseSnapshot();
+                } else {
+                    return {
+                        content: [{
+                            type: "text",
+                            text: `Codebase '${absolutePath}' is already being indexed in the background. Please wait for completion.`
+                        }],
+                        isError: true
+                    };
+                }
             }
 
             //Check if the snapshot and cloud index are in sync
-            if (this.snapshotManager.getIndexedCodebases().includes(absolutePath) !== await this.context.hasIndex(absolutePath)) {
-                console.warn(`[INDEX-VALIDATION] ❌ Snapshot and cloud index mismatch: ${absolutePath}`);
+            const snapshotHasIndex = this.snapshotManager.getIndexedCodebases().includes(absolutePath);
+            const vectorDbHasIndex = await this.context.hasIndex(absolutePath);
+            if (snapshotHasIndex !== vectorDbHasIndex) {
+                if (vectorDbHasIndex && !snapshotHasIndex) {
+                    // Query Milvus for real row count. If unknown/empty, log and move on
+                    // without writing 0/0+completed (which would trigger the force-reindex
+                    // loop in Issue #295). The user is about to (re)index anyway.
+                    const stats = await this.queryCollectionStats(absolutePath);
+                    if (stats) {
+                        console.warn(`[INDEX-VALIDATION] Recovering missing snapshot for '${absolutePath}' (rows=${stats.totalChunks})`);
+                        this.snapshotManager.setCodebaseIndexed(absolutePath, { ...stats, status: 'completed' as const });
+                        this.snapshotManager.saveCodebaseSnapshot();
+                    } else {
+                        console.warn(`[INDEX-VALIDATION] VectorDB reports index for '${absolutePath}' but row count unknown/zero — not writing snapshot entry`);
+                    }
+                } else if (!vectorDbHasIndex && snapshotHasIndex) {
+                    console.warn(`[INDEX-VALIDATION] Clearing stale snapshot for '${absolutePath}'`);
+                    this.snapshotManager.removeCodebaseCompletely(absolutePath);
+                    this.snapshotManager.saveCodebaseSnapshot();
+                }
             }
 
             // Check if already indexed (unless force is true)
@@ -217,10 +404,8 @@ export class ToolHandlers {
 
             // If force reindex and codebase is already indexed, remove it
             if (forceReindex) {
-                if (this.snapshotManager.getIndexedCodebases().includes(absolutePath)) {
-                    console.log(`[FORCE-REINDEX] 🔄 Removing '${absolutePath}' from indexed list for re-indexing`);
-                    this.snapshotManager.removeIndexedCodebase(absolutePath);
-                }
+                this.snapshotManager.removeCodebaseCompletely(absolutePath);
+                this.snapshotManager.saveCodebaseSnapshot();
                 if (await this.context.hasIndex(absolutePath)) {
                     console.log(`[FORCE-REINDEX] 🔄 Clearing index for '${absolutePath}'`);
                     await this.context.clearIndex(absolutePath);
@@ -346,7 +531,7 @@ export class ToolHandlers {
             const { FileSynchronizer } = await import("@zilliz/claude-context-core");
             const ignorePatterns = this.context.getIgnorePatterns() || [];
             console.log(`[BACKGROUND-INDEX] Using ignore patterns: ${ignorePatterns.join(', ')}`);
-            const synchronizer = new FileSynchronizer(absolutePath, ignorePatterns);
+            const synchronizer = new FileSynchronizer(absolutePath, ignorePatterns, this.context.getSupportedExtensions());
             await synchronizer.initialize();
 
             // Store synchronizer in the context (let context manage collection names)
@@ -452,13 +637,36 @@ export class ToolHandlers {
             const isIndexing = this.snapshotManager.getIndexingCodebases().includes(absolutePath);
 
             if (!isIndexed && !isIndexing) {
-                return {
-                    content: [{
-                        type: "text",
-                        text: `Error: Codebase '${absolutePath}' is not indexed. Please index it first using the index_codebase tool.`
-                    }],
-                    isError: true
-                };
+                // Fallback: check VectorDB directly in case snapshot is out of sync.
+                // Only recover the snapshot when we can confirm a real row count —
+                // writing 0/0+completed for an unverifiable collection poisons the
+                // client into a force-reindex loop (Issue #295).
+                const hasVectorIndex = await this.context.hasIndex(absolutePath);
+                if (hasVectorIndex) {
+                    const stats = await this.queryCollectionStats(absolutePath);
+                    if (stats) {
+                        console.warn(`[SEARCH] Snapshot missing but VectorDB has index for '${absolutePath}', recovering snapshot (rows=${stats.totalChunks})`);
+                        this.snapshotManager.setCodebaseIndexed(absolutePath, { ...stats, status: 'completed' as const });
+                        this.snapshotManager.saveCodebaseSnapshot();
+                        // Continue with search (don't return error)
+                    } else {
+                        return {
+                            content: [{
+                                type: "text",
+                                text: `Error: Codebase '${absolutePath}' is not indexed. Please index it first using the index_codebase tool.`
+                            }],
+                            isError: true
+                        };
+                    }
+                } else {
+                    return {
+                        content: [{
+                            type: "text",
+                            text: `Error: Codebase '${absolutePath}' is not indexed. Please index it first using the index_codebase tool.`
+                        }],
+                        isError: true
+                    };
+                }
             }
 
             // Show indexing status if codebase is being indexed
@@ -506,6 +714,18 @@ export class ToolHandlers {
             console.log(`[SEARCH] ✅ Search completed! Found ${searchResults.length} results using ${embeddingProvider.getProvider()} embeddings`);
 
             if (searchResults.length === 0) {
+                // Check if collection was lost (indexed locally but missing in Milvus)
+                if (isIndexed && !isIndexing) {
+                    const collectionName = this.context.getCollectionName(absolutePath);
+                    const hasCollection = await this.context.getVectorDatabase().hasCollection(collectionName);
+                    if (!hasCollection) {
+                        return {
+                            content: [{ type: "text", text: `Error: Index data for '${absolutePath}' has been lost (collection not found in Milvus). Please re-index using index_codebase with force=true.` }],
+                            isError: true
+                        };
+                    }
+                }
+
                 let noResultsMessage = `No results found for query: "${query}" in codebase '${absolutePath}'`;
                 if (isIndexing) {
                     noResultsMessage += `\n\nNote: This codebase is still being indexed. Try searching again after indexing completes, or the query may not match any indexed content.`;

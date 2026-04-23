@@ -127,10 +127,24 @@ export interface VectorDatabase {
     query(collectionName: string, filter: string, outputFields: string[], limit?: number): Promise<Record<string, any>[]>;
 
     /**
+     * Get collection description
+     * @param collectionName Collection name
+     * @returns Collection description string
+     */
+    getCollectionDescription(collectionName: string): Promise<string>;
+
+    /**
      * Check collection limit
      * Returns true if collection can be created, false if limit exceeded
      */
     checkCollectionLimit(): Promise<boolean>;
+
+    /**
+     * Get the number of entities (rows) in a collection.
+     * Returns -1 if the count cannot be determined (query failed, collection missing, etc).
+     * Callers should treat -1 as "unknown" and NOT as "empty".
+     */
+    getCollectionRowCount(collectionName: string): Promise<number>;
 }
 
 /**

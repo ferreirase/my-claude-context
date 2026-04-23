@@ -1,5 +1,7 @@
 ![](assets/claude-context.png)
 
+> 🆕 **Looking for persistent memory for Claude Code?** Check out [memsearch Claude Code plugin](https://github.com/zilliztech/memsearch/tree/main/plugins/claude-code) — a markdown-first memory system that gives your AI agent long-term memory across sessions.
+
 ### Your entire codebase as Claude's context
 
 [![License](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
@@ -11,6 +13,7 @@
 [![Twitter](https://img.shields.io/twitter/url/https/twitter.com/zilliz_universe.svg?style=social&label=Follow%20%40Zilliz)](https://twitter.com/zilliz_universe)
 [![DeepWiki](https://img.shields.io/badge/DeepWiki-AI%20Docs-purple.svg?logo=gitbook&logoColor=white)](https://deepwiki.com/zilliztech/claude-context)
 <a href="https://discord.gg/mKc3R95yE5"><img height="20" src="https://img.shields.io/badge/Discord-%235865F2.svg?style=for-the-badge&logo=discord&logoColor=white" alt="discord" /></a>
+<a href="https://trendshift.io/repositories/15064"><img src="https://trendshift.io/api/badge/repositories/15064" alt="zilliztech/claude-context | Trendshift" width="250" height="55" /></a>
 </div>
 
 **Claude Context** is an MCP plugin that adds semantic code search to Claude Code and other AI coding agents, giving them deep context from your entire codebase.
@@ -66,6 +69,7 @@ Use the command line interface to add the Claude Context MCP server:
 ```bash
 claude mcp add claude-context \
   -e OPENAI_API_KEY=sk-your-openai-api-key \
+  -e MILVUS_ADDRESS=your-zilliz-cloud-public-endpoint \
   -e MILVUS_TOKEN=your-zilliz-cloud-api-key \
   -- npx @zilliz/claude-context-mcp@latest
 ```
@@ -150,11 +154,9 @@ Create or edit the `~/.qwen/settings.json` file and add the following configurat
 <details>
 <summary><strong>Cursor</strong></summary>
 
-<a href="https://cursor.com/install-mcp?name=claude-context&config=JTdCJTIyY29tbWFuZCUyMiUzQSUyMm5weCUyMC15JTIwJTQwemlsbGl6JTJGY29kZS1jb250ZXh0LW1jcCU0MGxhdGVzdCUyMiUyQyUyMmVudiUyMiUzQSU3QiUyMk9QRU5BSV9BUElfS0VZJTIyJTNBJTIyeW91ci1vcGVuYWktYXBpLWtleSUyMiUyQyUyMk1JTFZVU19BRERSRVNTJTIyJTNBJTIybG9jYWxob3N0JTNBMTk1MzAlMjIlN0QlN0Q%3D"><img src="https://cursor.com/deeplink/mcp-install-dark.svg" alt="Add claude-context MCP server to Cursor" height="32" /></a>
-
 Go to: `Settings` -> `Cursor Settings` -> `MCP` -> `Add new global MCP server`
 
-Pasting the following configuration into your Cursor `~/.cursor/mcp.json` file is the recommended approach. You may also install in a specific project by creating `.cursor/mcp.json` in your project folder. See [Cursor MCP docs](https://docs.cursor.com/context/model-context-protocol) for more info.
+Pasting the following configuration into your Cursor `~/.cursor/mcp.json` file is the recommended approach. You may also install in a specific project by creating `.cursor/mcp.json` in your project folder. See [Cursor MCP docs](https://cursor.com/docs/context/mcp) for more info.
 
 ```json
 {
@@ -543,7 +545,7 @@ Claude Context is a monorepo containing three main packages:
 
 ### Supported Technologies
 
-- **Embedding Providers**: [OpenAI](https://openai.com), [VoyageAI](https://voyageai.com), [Ollama](https://ollama.ai), [Gemini](https://gemini.google.com)
+- **Embedding Providers**: [OpenAI](https://openai.com), [VoyageAI](https://voyageai.com), [Ollama](https://ollama.com), [Gemini](https://gemini.google.com)
 - **Vector Databases**: [Milvus](https://milvus.io) or [Zilliz Cloud](https://zilliz.com/cloud)(fully managed vector database as a service)
 - **Code Splitters**: AST-based splitter (with automatic fallback), LangChain character-based splitter
 - **Languages**: TypeScript, JavaScript, Python, Java, C++, C#, Go, Rust, PHP, Ruby, Swift, Kotlin, Scala, Markdown

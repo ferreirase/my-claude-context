@@ -134,7 +134,7 @@ OLLAMA_HOST=http://127.0.0.1:11434
 
 **Setup Instructions:**
 
-1. Install Ollama from [ollama.ai](https://ollama.ai/)
+1. Install Ollama from [ollama.com](https://ollama.com/)
 2. Pull the embedding model:
 
    ```bash
@@ -278,7 +278,7 @@ Create or edit the `~/.qwen/settings.json` file and add the following configurat
 
 Go to: `Settings` -> `Cursor Settings` -> `MCP` -> `Add new global MCP server`
 
-Pasting the following configuration into your Cursor `~/.cursor/mcp.json` file is the recommended approach. You may also install in a specific project by creating `.cursor/mcp.json` in your project folder. See [Cursor MCP docs](https://docs.cursor.com/context/model-context-protocol) for more info.
+Pasting the following configuration into your Cursor `~/.cursor/mcp.json` file is the recommended approach. You may also install in a specific project by creating `.cursor/mcp.json` in your project folder. See [Cursor MCP docs](https://cursor.com/docs/context/mcp) for more info.
 
 **OpenAI Configuration (Default):**
 
@@ -667,6 +667,16 @@ Get the current indexing status of a codebase. Shows progress percentage for act
 **Parameters:**
 
 - `path` (required): Absolute path to the codebase directory to check status for
+
+**What the status output means:**
+
+- Progress is **phase-based**, not a direct file-count ratio. The MCP server reports coarse milestones for collection preparation, file scanning, and file processing / embedding work.
+- Because indexing runs in the background and progress is persisted periodically, percentages can jump quickly on large repositories or appear unchanged for a while during long embedding batches.
+- File and chunk statistics are written when an indexing run finishes successfully. During active indexing, `get_indexing_status` intentionally reports progress rather than live file/chunk totals.
+- Codebases are keyed by their **absolute path**. Indexing `/repo`, a symlinked path to the same repo, and a second clone will create separate tracked entries.
+- If a completed entry shows `0 files, 0 chunks`, that usually means the local snapshot metadata is stale rather than the vector database being queried live. Re-indexing, or clearing and re-indexing that exact absolute path, refreshes the stored stats.
+
+For a deeper explanation, see the [asynchronous indexing workflow guide](../../docs/dive-deep/asynchronous-indexing-workflow.md) and the [troubleshooting FAQ](../../docs/troubleshooting/faq.md).
 
 ## Contributing
 

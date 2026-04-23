@@ -434,16 +434,21 @@ export class MilvusVectorDatabase implements VectorDatabase {
         try {
             const queryParams: any = {
                 collection_name: collectionName,
-                filter: filter,
                 output_fields: outputFields,
             };
 
-            // Add limit if provided, or default for empty filter expressions
+            // Only include filter if it's a non-empty, non-whitespace string
+            // An empty string filter is falsy in JS and causes Milvus SDK to return empty results
+            if (filter && filter.trim() !== '') {
+                queryParams.filter = filter;
+            }
+
+            // Add limit if provided, or default when no filter is specified
             if (limit !== undefined) {
                 queryParams.limit = limit;
-            } else if (filter === '' || filter.trim() === '') {
-                // Milvus requires limit when using empty expressions
-                queryParams.limit = 16384; // Default limit for empty filters
+            } else if (!filter || filter.trim() === '') {
+                // Milvus requires limit when no filter expression is provided
+                queryParams.limit = 16384; // Default limit for unfiltered queries
             }
 
             const result = await this.client.query(queryParams);
@@ -714,6 +719,20 @@ export class MilvusVectorDatabase implements VectorDatabase {
         }
     }
 
+    async getCollectionDescription(collectionName: string): Promise<string> {
+        await this.ensureInitialized();
+
+        if (!this.client) {
+            throw new Error('MilvusClient is not initialized after ensureInitialized().');
+        }
+
+        const result = await this.client.describeCollection({
+            collection_name: collectionName,
+        });
+
+        return (result as any).schema?.description || '';
+    }
+
     /**
      * Wrapper method to handle collection creation with limit detection for gRPC client
      * Returns true if collection can be created, false if limit exceeded
@@ -760,6 +779,51 @@ export class MilvusVectorDatabase implements VectorDatabase {
             }
             // Re-throw other errors as-is
             throw error;
+        }
+    }
+
+    /**
+     * Get the number of entities (rows) in a collection.
+     * Returns -1 on any failure (collection missing, RPC error, malformed response).
+     * -1 means "unknown" — callers must NOT treat it as "empty".
+     *
+     * Uses count(*) via query() rather than getCollectionStatistics(): stats are
+     * computed from sealed segments and lag recent inserts (returning 0 for a
+     * freshly-indexed but unflushed collection), while count(*) reads the real
+     * current state. A stale 0 would fool recovery into thinking the collection
+     * is truly empty and cause Issue #295-style false-negative "not indexed"
+     * errors even when data exists.
+     */
+    async getCollectionRowCount(collectionName: string): Promise<number> {
+        await this.ensureInitialized();
+        if (!this.client) return -1;
+        try {
+            const hasCol = await this.client.hasCollection({ collection_name: collectionName });
+            if (!hasCol.value) return -1;
+
+            // count(*) requires the collection to be loaded.
+            await this.ensureLoaded(collectionName);
+
+            const result = await this.client.query({
+                collection_name: collectionName,
+                output_fields: ['count(*)'],
+                expr: '',
+            });
+            if (result.status.error_code !== 'Success') {
+                console.warn(`[MilvusDB] count(*) query failed for '${collectionName}': ${result.status.reason}`);
+                return -1;
+            }
+
+            // Shape observed: { data: [{ "count(*)": "<number-as-string>" }] }
+            const row = result.data?.[0] as Record<string, any> | undefined;
+            if (!row) return -1;
+            const raw = row['count(*)'] ?? row['count'];
+            if (raw === undefined || raw === null) return -1;
+            const n = typeof raw === 'number' ? raw : parseInt(String(raw), 10);
+            return Number.isFinite(n) && n >= 0 ? n : -1;
+        } catch (error) {
+            console.error(`[MilvusDB] Error in count(*) query for '${collectionName}':`, error);
+            return -1;
         }
     }
 }
